@@ -22,17 +22,23 @@ def one_pass_variance(x):
 
 
 def pairwise_variance(x):
-    N = x.shape[-1]
-    if N % 2 != 0:
-        x = x[..., :-1]
-        N -= 1
-    x1, x2 = x[..., : N // 2], x[..., N // 2 :]
-    mu1 = x1.mean(axis=-1, keepdims=True)
-    mu2 = x2.mean(axis=-1, keepdims=True)
-    var1 = ((x1 - mu1) ** 2).mean(axis=-1, keepdims=True)
-    var2 = ((x2 - mu2) ** 2).mean(axis=-1, keepdims=True)
-    delta = mu1 - mu2
-    return var1 + var2 + (delta**2) * (N // 2) * (N // 2) / N
+    splits = np.split(x, 4, axis=-1)  # G1, G2, G3, G4
+    n = [s.shape[-1] for s in splits]
+    mu = [s.mean(axis=-1, keepdims=True) for s in splits]
+    var = [s.var(axis=-1, keepdims=True) for s in splits]
+
+    delta12 = mu[0] - mu[1]
+    intVar1 = var[0] + var[1] + (delta12**2) * (n[0] * n[1]) / (n[0] + n[1])
+
+    delta34 = mu[2] - mu[3]
+    intVar2 = var[2] + var[3] + (delta34**2) * (n[2] * n[3]) / (n[2] + n[3])
+
+    mu12 = (mu[0] * n[0] + mu[1] * n[1]) / (n[0] + n[1])
+    mu34 = (mu[2] * n[2] + mu[3] * n[3]) / (n[2] + n[3])
+    delta = mu12 - mu34
+    correction = (delta**2) * ((n[0] + n[1]) * (n[2] + n[3])) / sum(n)
+
+    return intVar1 + intVar2 + correction
 
 
 # PWL fit
@@ -81,9 +87,9 @@ with torch.no_grad():
     var_torch = torch.var(torch_input, dim=-1, unbiased=False, keepdim=True).numpy()
 
 # Accuracy (% error)
-err_true = np.abs(true_var - var_torch) / (var_torch + 1e-8) * 100
-err_one = np.abs(onepass_var - var_torch) / (var_torch + 1e-8) * 100
-err_pair = np.abs(pairwise_var - var_torch) / (var_torch + 1e-8) * 100
+acc_true = 100 - np.abs(true_var - var_torch) / (var_torch + 1e-8) * 100
+acc_one = 100 - np.abs(onepass_var - var_torch) / (var_torch + 1e-8) * 100
+acc_pair = 100 - np.abs(pairwise_var - var_torch) / (var_torch + 1e-8) * 100
 
 # Sqrt & reciprocal comparisons
 sqrt_exact, t_sqrt_exact = measure_time(np.sqrt, true_var + 1e-5)
@@ -96,16 +102,16 @@ recip_pwl, t_recip = measure_time(
     pwl_approx, sqrt_pwl, recip_breaks, recip_slopes, recip_intercepts
 )
 
-err_sqrt = np.abs(sqrt_exact - sqrt_pwl) / (sqrt_exact + 1e-8) * 100
-err_recip = np.abs(recip_exact - recip_pwl) / (recip_exact + 1e-8) * 100
+acc_sqrt = 100 - np.abs(sqrt_exact - sqrt_pwl) / (sqrt_exact + 1e-8) * 100
+acc_recip = 100 - np.abs(recip_exact - recip_pwl) / (recip_exact + 1e-8) * 100
 
 # Print results
 print("===== Accuracy (% Error vs PyTorch) =====")
-print(f"[True Var]     {err_true.mean():.4f}%")
-print(f"[One-Pass Var] {err_one.mean():.4f}%")
-print(f"[Pairwise Var] {err_pair.mean():.4f}%")
-print(f"[Sqrt PWL]     {err_sqrt.mean():.4f}%")
-print(f"[Recip PWL]    {err_recip.mean():.4f}%")
+print(f"[True Var]     {acc_true.mean():.4f}%")
+print(f"[One-Pass Var] {acc_one.mean():.4f}%")
+print(f"[Pairwise Var] {acc_pair.mean():.4f}%")
+print(f"[Sqrt PWL]     {acc_sqrt.mean():.4f}%")
+print(f"[Recip PWL]    {acc_recip.mean():.4f}%")
 
 print("\n===== Timing (ms) =====")
 print(f"[True Var]        {t_true:.4f} ms")
