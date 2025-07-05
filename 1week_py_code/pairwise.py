@@ -2,78 +2,93 @@ import numpy as np
 import time
 import torch
 
-# Generate input
-N, embedding_dim = 100, 768
-np_embeddings = np.random.randn(N, embedding_dim).astype(np.float32)
-torch_input = torch.tensor(np_embeddings, dtype=torch.float32)
+# Generate float32 input and convert to Q8.8 fixed-point
+N, embedding_dim = 96, 768
+np_embeddings_f = np.random.randn(N, embedding_dim).astype(np.float32)
+torch_input = torch.tensor(np_embeddings_f, dtype=torch.float32)
 
 
-# Variance methods
-def true_variance(x):
-    mean = x.mean(axis=-1, keepdims=True)
-    return ((x - mean) ** 2).mean(axis=-1, keepdims=True)
+def float_to_q8_8(x):
+    return np.round(x * 256).astype(np.int16)
 
 
-def one_pass_variance(x):
-    mean = x.mean(axis=-1, keepdims=True)
-    mean_sq = (x**2).mean(axis=-1, keepdims=True)
-    return mean_sq - mean**2
+def q8_8_to_float(x_q):
+    return x_q.astype(np.float32) / 256
+
+
+# Convert float input to Q8.8
+np_embeddings_q8_8 = float_to_q8_8(np_embeddings_f).astype(np.int32)
+
+
+# Variance methods (Q8.8 integer input)
+def true_variance_q8_8(x_q):
+    N = x_q.shape[-1]
+    mean = np.sum(x_q, axis=-1, keepdims=True) // N
+    var = np.sum((x_q - mean) ** 2, axis=-1, keepdims=True) // N
+    return q8_8_to_float(var // 256)
+
+
+def one_pass_variance_q8_8(x_q):
+    N = x_q.shape[-1]
+    sum_x = np.sum(x_q, axis=-1, keepdims=True)
+    sum_x2 = np.sum(x_q * x_q, axis=-1, keepdims=True)
+    mean = sum_x // N
+    mean_sq = sum_x2 // N
+    var = mean_sq - (mean * mean)
+    return q8_8_to_float(var // 256)  # mean^2 is Q16.16 → Q8.8
 
 
 import numpy as np
 
 
-def pairwise_variance(x):
-    # Number of groups to split into (must be a power of two)
+def float_to_q8_8(x):
+    return np.round(x * 256).astype(np.int16)
+
+
+def q8_8_to_float(x_q):
+    return x_q.astype(np.float32) / 256
+
+
+def pairwise_variance_q8_8(x_q):
     G = 16
-    D = x.shape[-1]
-    # Ensure the last dimension is divisible by G
-    assert D % G == 0, f"Last dim {D} must be divisible by {G}"
+    D = x_q.shape[-1]
+    assert D % G == 0
 
-    # Split the input tensor into G equal parts along the last axis
-    splits = np.split(x, G, axis=-1)
+    splits = np.split(x_q, G, axis=-1)
+    n_list = [s.shape[-1] for s in splits]
+    mu_list = [np.sum(s, axis=-1, keepdims=True) // s.shape[-1] for s in splits]
 
-    # Compute per-group counts, means, and sum of squared deviations:
-    # M_i = sum_j (x_ij - mu_i)^2 = n_i * var_i
-    n_list = [s.shape[-1] for s in splits]  # number of elements in each group
-    mu_list = [s.mean(axis=-1, keepdims=True) for s in splits]  # group means (mu_i)
     M_list = [
-        np.var(s, axis=-1, keepdims=True, ddof=0)
-        * n  # group sum of squared deviations (M_i)
-        for s, n in zip(splits, n_list)
+        np.sum(((s - mu).astype(np.int64)) ** 2, axis=-1, keepdims=True)
+        for s, mu in zip(splits, mu_list)
     ]
 
-    # Iteratively merge groups in pairs: 16 -> 8 -> 4 -> 2 -> 1
     while len(mu_list) > 1:
         next_mu, next_M, next_n = [], [], []
         for i in range(0, len(mu_list), 2):
-            # Grab two adjacent groups
             μ1, μ2 = mu_list[i], mu_list[i + 1]
             M1, M2 = M_list[i], M_list[i + 1]
             n1, n2 = n_list[i], n_list[i + 1]
+            n_total = n1 + n2
 
-            # Compute merged sum of squared deviations:
-            # M_12 = M1 + M2 + (mu1 - mu2)^2 * (n1 * n2) / (n1 + n2)
             delta = μ1 - μ2
-            M12 = M1 + M2 + delta**2 * (n1 * n2) / (n1 + n2)
+            delta_sq = (delta.astype(np.int64)) ** 2  # Q16.16
+            delta_term = (delta_sq * n1 * n2) // n_total  # Q16.16
+
+            M12 = M1 + M2 + delta_term  # Q16.16
+            mu12 = (μ1 * n1 + μ2 * n2) // n_total
+
+            next_mu.append(mu12)
             next_M.append(M12)
+            next_n.append(n_total)
 
-            # Compute merged mean and count:
-            # mu_12 = (n1 * mu1 + n2 * mu2) / (n1 + n2)
-            next_mu.append((μ1 * n1 + μ2 * n2) / (n1 + n2))
-            next_n.append(n1 + n2)
-
-        # Prepare for next iteration
         mu_list, M_list, n_list = next_mu, next_M, next_n
 
-    # After merging, compute final biased variance:
-    M_total = M_list[0]  # total sum of squared deviations
-    n_total = n_list[0]  # total number of elements
-    var_total = M_total / n_total  # biased variance = M_total / n_total
-    return var_total
+    var_q16 = M_list[0] // D
+    return q8_8_to_float(var_q16 // 256)  # Q16.16 → Q8.8 → float
 
 
-# Timer function
+# Timer
 def measure_time(func, *args):
     start = time.perf_counter()
     result = func(*args)
@@ -81,34 +96,33 @@ def measure_time(func, *args):
     return result, (end - start) * 1000
 
 
-# Accuracy 계산 함수
+# Accuracy 계산
 def percent_accuracy(est, ref):
     return 100 - np.abs(est - ref) / (ref + 1e-8) * 100
 
 
 # 실행
-x = np_embeddings
-true_var, t_true = measure_time(true_variance, x)
-onepass_var, t_onepass = measure_time(one_pass_variance, x)
-pairwise_var, t_pairwise = measure_time(pairwise_variance, x)
+x_q = np_embeddings_q8_8
+true_var, t_true = measure_time(true_variance_q8_8, x_q)
+onepass_var, t_onepass = measure_time(one_pass_variance_q8_8, x_q)
+pairwise_var, t_pairwise = measure_time(pairwise_variance_q8_8, x_q)
 
-# PyTorch 기준값
+# 기준값: float32 PyTorch
 with torch.no_grad():
     var_torch = torch.var(torch_input, dim=-1, unbiased=False, keepdim=True).numpy()
 
-# 정확도 계산
+# 정확도
 acc_true = percent_accuracy(true_var, var_torch)
 acc_one = percent_accuracy(onepass_var, var_torch)
 acc_pair = percent_accuracy(pairwise_var, var_torch)
 
-
 # 출력
 print("===== Accuracy (% Error vs PyTorch) =====")
-print(f"[True Var]     {acc_true.mean():.4f}%")
-print(f"[One-Pass Var] {acc_one.mean():.4f}%")
-print(f"[Pairwise Var] {acc_pair.mean():.4f}%")
+print(f"[True Var Q8.8]     {acc_true.mean():.4f}%")
+print(f"[One-Pass Q8.8]     {acc_one.mean():.4f}%")
+print(f"[Pairwise Q8.8]     {acc_pair.mean():.4f}%")
 
 print("\n===== Timing (ms) =====")
-print(f"[True Var]     {t_true:.4f} ms")
-print(f"[One-Pass Var] {t_onepass:.4f} ms")
-print(f"[Pairwise Var] {t_pairwise:.4f} ms")
+print(f"[True Var Q8.8]     {t_true:.4f} ms")
+print(f"[One-Pass Q8.8]     {t_onepass:.4f} ms")
+print(f"[Pairwise Q8.8]     {t_pairwise:.4f} ms")

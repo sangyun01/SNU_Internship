@@ -1,48 +1,57 @@
 import numpy as np
-import time
-import pwlf
 import torch
+import pwlf
 
-# Generate input
-N, embedding_dim = 100, 768
-np_embeddings = np.random.randn(N, embedding_dim).astype(np.float32)
-torch_input = torch.tensor(np_embeddings, dtype=torch.float32)
-
-
-# Variance methods
-def true_variance(x):
-    mean = x.mean(axis=-1, keepdims=True)
-    return ((x - mean) ** 2).mean(axis=-1, keepdims=True)
+# === 입력 생성 ===
+N, D = 96, 768
+np_embeddings_f = np.random.randn(N, D).astype(np.float32)
+torch_input = torch.tensor(np_embeddings_f, dtype=torch.float32)
 
 
-def one_pass_variance(x):
-    mean = x.mean(axis=-1, keepdims=True)
-    mean_sq = (x**2).mean(axis=-1, keepdims=True)
-    return mean_sq - mean**2
+# === Q8.8 변환 함수 ===
+def float_to_q8_8(x):
+    return np.round(x * 256).astype(np.int16)
 
 
-def pairwise_variance(x):
-    splits = np.split(x, 4, axis=-1)  # G1, G2, G3, G4
-    n = [s.shape[-1] for s in splits]
-    mu = [s.mean(axis=-1, keepdims=True) for s in splits]
-    var = [s.var(axis=-1, keepdims=True) for s in splits]
-
-    delta12 = mu[0] - mu[1]
-    intVar1 = var[0] + var[1] + (delta12**2) * (n[0] * n[1]) / (n[0] + n[1])
-
-    delta34 = mu[2] - mu[3]
-    intVar2 = var[2] + var[3] + (delta34**2) * (n[2] * n[3]) / (n[2] + n[3])
-
-    mu12 = (mu[0] * n[0] + mu[1] * n[1]) / (n[0] + n[1])
-    mu34 = (mu[2] * n[2] + mu[3] * n[3]) / (n[2] + n[3])
-    delta = mu12 - mu34
-    correction = (delta**2) * ((n[0] + n[1]) * (n[2] + n[3])) / sum(n)
-
-    return intVar1 + intVar2 + correction
+def q8_8_to_float(x_q):
+    return x_q.astype(np.float32) / 256
 
 
-# PWL fit
-x_vals = np.linspace(0.01, 128, 1000)
+np_embeddings_q8_8 = float_to_q8_8(np_embeddings_f).astype(np.int32)
+
+
+# === Q8.8 기반 pairwise 분산 계산 ===
+def pairwise_variance_q8_8(x_q, G=16):
+    D = x_q.shape[-1]
+    splits = np.split(x_q, G, axis=-1)
+    n_list = [s.shape[-1] for s in splits]
+    mu_list = [np.sum(s, axis=-1, keepdims=True) // s.shape[-1] for s in splits]
+    M_list = [
+        np.sum(((s - mu).astype(np.int64)) ** 2, axis=-1, keepdims=True)
+        for s, mu in zip(splits, mu_list)
+    ]
+    while len(mu_list) > 1:
+        next_mu, next_M, next_n = [], [], []
+        for i in range(0, len(mu_list), 2):
+            μ1, μ2 = mu_list[i], mu_list[i + 1]
+            M1, M2 = M_list[i], M_list[i + 1]
+            n1, n2 = n_list[i], n_list[i + 1]
+            n_total = n1 + n2
+            delta = μ1 - μ2
+            delta_sq = (delta.astype(np.int64)) ** 2
+            delta_term = (delta_sq * n1 * n2) // n_total
+            M12 = M1 + M2 + delta_term
+            mu12 = (μ1 * n1 + μ2 * n2) // n_total
+            next_mu.append(mu12)
+            next_M.append(M12)
+            next_n.append(n_total)
+        mu_list, M_list, n_list = next_mu, next_M, next_n
+    var_q16 = M_list[0] // D
+    return q8_8_to_float(var_q16 // 256)
+
+
+# === PWL 모델 준비 (sqrt, reciprocal) ===
+x_vals = np.linspace(0.01, 64, 1000)
 sqrt_vals = np.sqrt(x_vals)
 recip_vals = 1 / sqrt_vals
 
@@ -57,7 +66,7 @@ recip_slopes = recip_model.slopes
 recip_intercepts = recip_model.intercepts
 
 
-# PWL approximation
+# === PWL 근사 함수 ===
 def pwl_approx(x, breakpoints, slopes, intercepts):
     x = np.clip(x, breakpoints[0], breakpoints[-1])
     out = np.zeros_like(x)
@@ -68,56 +77,65 @@ def pwl_approx(x, breakpoints, slopes, intercepts):
     return out
 
 
-# Timer
-def measure_time(func, *args):
-    start = time.perf_counter()
-    result = func(*args)
-    end = time.perf_counter()
-    return result, (end - start) * 1000
+# === 최종 근사 LayerNorm ===
+def approx_layernorm_q8_8(x_q, eps=1e-5):
+    mu_q = np.mean(x_q, axis=-1, keepdims=True)
+    x_centered = x_q - mu_q
+    var_approx = pairwise_variance_q8_8(x_q)  # float
+    sqrt_val = pwl_approx(var_approx + eps, sqrt_breaks, sqrt_slopes, sqrt_intercepts)
+    recip_val = pwl_approx(sqrt_val, recip_breaks, recip_slopes, recip_intercepts)
+    x_float = q8_8_to_float(x_centered)
+    return x_float * recip_val
 
 
-# Measure variance
-x = np_embeddings
-true_var, t_true = measure_time(true_variance, x)
-onepass_var, t_onepass = measure_time(one_pass_variance, x)
-pairwise_var, t_pairwise = measure_time(pairwise_variance, x)
+# === 단계별 비교 ===
 
-# PyTorch variance (ground truth)
-with torch.no_grad():
-    var_torch = torch.var(torch_input, dim=-1, unbiased=False, keepdim=True).numpy()
+# 1. Pairwise + 정확 sqrt + 정확 reciprocal
+var_pairwise = pairwise_variance_q8_8(np_embeddings_q8_8)
+sqrt_exact = np.sqrt(var_pairwise + 1e-5)
+recip_exact = 1.0 / sqrt_exact
+mu_q = np.mean(np_embeddings_q8_8, axis=-1, keepdims=True)
+Y_exact = q8_8_to_float(np_embeddings_q8_8 - mu_q) * recip_exact
 
-# Accuracy (% error)
-acc_true = 100 - np.abs(true_var - var_torch) / (var_torch + 1e-8) * 100
-acc_one = 100 - np.abs(onepass_var - var_torch) / (var_torch + 1e-8) * 100
-acc_pair = 100 - np.abs(pairwise_var - var_torch) / (var_torch + 1e-8) * 100
+# 2. Pairwise + PWL sqrt + 정확 reciprocal
+sqrt_pwl = pwl_approx(var_pairwise + 1e-5, sqrt_breaks, sqrt_slopes, sqrt_intercepts)
+recip_exact2 = 1.0 / sqrt_pwl
+Y_pwl_sqrt = q8_8_to_float(np_embeddings_q8_8 - mu_q) * recip_exact2
 
-# Sqrt & reciprocal comparisons
-sqrt_exact, t_sqrt_exact = measure_time(np.sqrt, true_var + 1e-5)
-sqrt_pwl, t_sqrt = measure_time(
-    pwl_approx, true_var + 1e-5, sqrt_breaks, sqrt_slopes, sqrt_intercepts
-)
+# 3. Pairwise + PWL sqrt + PWL reciprocal (최종 구조)
+recip_pwl = pwl_approx(sqrt_pwl, recip_breaks, recip_slopes, recip_intercepts)
+Y_pwl_full = q8_8_to_float(np_embeddings_q8_8 - mu_q) * recip_pwl
 
-recip_exact, t_recip_exact = measure_time(np.reciprocal, sqrt_exact)
-recip_pwl, t_recip = measure_time(
-    pwl_approx, sqrt_pwl, recip_breaks, recip_slopes, recip_intercepts
-)
+# === 기준값: PyTorch LayerNorm ===
+layernorm_torch = torch.nn.LayerNorm(D, elementwise_affine=False)
+Y_true = layernorm_torch(torch_input).numpy()
 
-acc_sqrt = 100 - np.abs(sqrt_exact - sqrt_pwl) / (sqrt_exact + 1e-8) * 100
-acc_recip = 100 - np.abs(recip_exact - recip_pwl) / (recip_exact + 1e-8) * 100
+# === 근사 계산값 ===
+Y_approx = approx_layernorm_q8_8(np_embeddings_q8_8)
 
-# Print results
-print("===== Accuracy (% Error vs PyTorch) =====")
-print(f"[True Var]     {acc_true.mean():.4f}%")
-print(f"[One-Pass Var] {acc_one.mean():.4f}%")
-print(f"[Pairwise Var] {acc_pair.mean():.4f}%")
-print(f"[Sqrt PWL]     {acc_sqrt.mean():.4f}%")
-print(f"[Recip PWL]    {acc_recip.mean():.4f}%")
+# === 정확도 측정 ===
+mae = np.mean(np.abs(Y_true - Y_approx))
+relative_acc = 100 - (mae / (np.abs(Y_true).mean() + 1e-8)) * 100
 
-print("\n===== Timing (ms) =====")
-print(f"[True Var]        {t_true:.4f} ms")
-print(f"[One-Pass Var]    {t_onepass:.4f} ms")
-print(f"[Pairwise Var]    {t_pairwise:.4f} ms")
-print(f"[Sqrt Exact]      {t_sqrt_exact:.4f} ms")
-print(f"[Sqrt PWL]        {t_sqrt:.4f} ms")
-print(f"[Recip Exact]     {t_recip_exact:.4f} ms")
-print(f"[Recip PWL]       {t_recip:.4f} ms")
+print("===== LayerNorm Approximation =====")
+print(f"Relative Accuracy:    {relative_acc:.4f}%")
+
+# 기준값
+Y_true = layernorm_torch(torch_input).numpy()
+
+
+# 정확도 비교
+def acc(y_hat):
+    return (
+        100 - (np.mean(np.abs(Y_true - y_hat)) / (np.mean(np.abs(Y_true)) + 1e-8)) * 100
+    )
+
+
+def mae(y_hat):
+    return np.mean(np.abs(Y_true - y_hat))
+
+
+print("===== 단계별 정확도 비교 =====")
+print(f"[1] Pairwise + Exact Sqrt/Recip   → Accuracy: {acc(Y_exact):.4f}%")
+print(f"[2] Pairwise + PWL Sqrt + Exact   → Accuracy: {acc(Y_pwl_sqrt):.4f}%")
+print(f"[3] Pairwise + PWL Sqrt + Recip   → Accuracy: {acc(Y_pwl_full):.4f}%")

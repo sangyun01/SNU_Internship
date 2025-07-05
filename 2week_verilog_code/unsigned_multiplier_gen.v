@@ -33,19 +33,5 @@ generate for (i = 1; i < N; i = i + 1) begin: hifh_bit_multiplier
     assign prod[N-1+i] = sum[i][N-1];
 end endgenerate 
 assign prod[2*N-1] = carry[N-1][N-1];
-/*generate
-    for (i = 0; i < N-1; i = i + 1) begin: low_bit
-        assign prod[i] = sum[0][i];
-    end
-    assign prod[N-1] = sum[0][N-1];
-endgenerate
-generate
-    for (i = 1; i < N; i = i + 1) begin: high_bit
-        assign prod[N+i-1] = sum[i][N-1];
-    end
-endgenerate
-
-assign prod[2*N-1] = carry[N-1][N-1];*/
-
 
 endmodule
