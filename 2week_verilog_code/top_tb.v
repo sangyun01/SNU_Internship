@@ -29,14 +29,14 @@ module top_tb;
     );
 
     initial begin
-        $readmemh("in_x.data", x_array);
-        $readmemh("in_y.data", y_array);
-        $readmemh("out_sum.data", expected_sum_array);
-        $readmemh("out_prod.data", expected_prod_array);
+        $readmemh("in_x.mem", x_array);
+        $readmemh("in_y.mem", y_array);
+        $readmemh("out_sum.mem", expected_sum_array);
+        $readmemh("out_prod.mem", expected_prod_array);
     end
 
     initial begin
-        #20;
+        #50;
         for (i = 0; i <= M - 1; i = i + 1) begin
             x = x_array[i];
             y = y_array[i];
@@ -49,7 +49,7 @@ module top_tb;
     end
 
     initial begin
-        #200 $finish;
+        #500 $finish;
     end
 
     initial begin

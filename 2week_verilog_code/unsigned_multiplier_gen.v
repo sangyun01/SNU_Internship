@@ -1,3 +1,5 @@
+`timescale 1ns/1ps 
+
 module unsigned_multiplier_gen #(parameter N = 4) (
     input [N-1:0] x,
     input [N-1:0] y,
@@ -12,8 +14,8 @@ genvar i, j;
 generate for(i = 0; i < N; i = i + 1) begin : multiplier
     if(i == 0)
         for(j = 0; j < N; j = j + 1) begin
-            assign sum [i][j] = x[j] & y[i];
-            assign carry [i][j] = 0;
+            assign sum [j][i] = x[j] & y[i];
+            assign carry [j][i] = 0;
         end
     else
         for(j = 0; j < N; j = j + 1) begin
