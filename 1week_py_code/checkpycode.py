@@ -1,8 +1,8 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from datasets import load_dataset
-from evaluate import load as load_metric
+import pandas as pd
+from datasets import Dataset
 from transformers import (
     BertTokenizer,
     BertForSequenceClassification,
@@ -23,7 +23,6 @@ class ApproxLayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
-        # ✅ 사전 계산된 .npz 파일에서 불러오기
         sqrt_npz = np.load("pwl_sqrt.npz")
         self.sqrt_breaks = torch.tensor(sqrt_npz["breaks"], dtype=torch.float32)
         self.sqrt_slopes = torch.tensor(sqrt_npz["slopes"], dtype=torch.float32)
@@ -51,7 +50,6 @@ class ApproxLayerNorm(nn.Module):
         return x_q.to(torch.float32) / 256
 
     def pairwise_variance_q8_8(self, x_q):
-        # x_q: int32 tensor of shape (B, D)
         B, D = x_q.shape
         splits = torch.chunk(x_q, self.G, dim=-1)
         n_list = [s.shape[-1] for s in splits]
@@ -60,7 +58,6 @@ class ApproxLayerNorm(nn.Module):
             torch.sum((s - mu).to(torch.int64) ** 2, dim=-1, keepdim=True)
             for s, mu in zip(splits, mu_list)
         ]
-
         while len(mu_list) > 1:
             next_mu, next_M, next_n = [], [], []
             for i in range(0, len(mu_list), 2):
@@ -75,29 +72,20 @@ class ApproxLayerNorm(nn.Module):
                 next_M.append(M12)
                 next_n.append(n1 + n2)
             mu_list, M_list, n_list = next_mu, next_M, next_n
-
-        var_q16 = M_list[0] // D  # Q16.0
-        var_float = self.q8_8_to_float(var_q16 // 256)  # -> Q8.8 → float
-        return var_float  # shape: (B, 1)
+        var_q16 = M_list[0] // D
+        return self.q8_8_to_float(var_q16 // 256)
 
     def forward(self, x):
-        # Step 1: convert to Q8.8
         x_q = self.float_to_q8_8(x).to(torch.int32)
         mu_q = torch.sum(x_q, dim=-1, keepdim=True) // x_q.shape[-1]
         x_centered_q = x_q - mu_q
-
-        # Step 2: pairwise Q8.8 variance
         var = self.pairwise_variance_q8_8(x_q)
-
-        # Step 3: apply PWL sqrt & reciprocal
         sqrt_var = self.pwl_approx(
             var + self.eps, self.sqrt_breaks, self.sqrt_slopes, self.sqrt_intercepts
         )
         inv_sqrt = self.pwl_approx(
             sqrt_var, self.recip_breaks, self.recip_slopes, self.recip_intercepts
         )
-
-        # Step 4: apply normalization (note: centered input은 float로 변환 필요)
         x_centered = self.q8_8_to_float(x_centered_q)
         x_norm = x_centered * inv_sqrt
         return x_norm * self.weight + self.bias
@@ -117,9 +105,32 @@ def replace_layernorm_with_approx(model):
 
 
 # -----------------------------
-# 3. SST-2 로드 (샘플 10개만)
+# 3. SST-2 샘플 데이터 정의
 # -----------------------------
-dataset = load_dataset("glue", "sst2")
+data = {
+    "sentence": [
+        "hide new secretions from the parental units",
+        "contains no wit , only labored gags",
+        "that loves its characters and communicates something rather beautiful about human nature",
+        "remains utterly satisfied to remain the same throughout",
+        "on the worst revenge-of-the-nerds clichés the filmmakers could dredge up",
+        "offers that rare combination of entertainment and education",
+        "there’s a magic here that’s missing from the later movies",
+        "it never took off , but it still works as a traveling snapshot",
+        "full of zest , sparkle , and children’s laughter",
+        "it’s the kind of movie that makes a career",
+    ],
+    "label": [0, 0, 1, 0, 0, 1, 1, 1, 1, 1],
+}
+
+df = pd.DataFrame(data)
+ds_train = Dataset.from_pandas(df)
+ds_eval = Dataset.from_pandas(df)
+
+
+# -----------------------------
+# 4. Tokenization
+# -----------------------------
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
 
@@ -127,24 +138,22 @@ def tokenize_function(example):
     return tokenizer(example["sentence"], padding="max_length", truncation=True)
 
 
-tokenized = dataset.map(tokenize_function, batched=True)
-tokenized = tokenized.rename_column("label", "labels")
-tokenized.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+ds_train = ds_train.map(tokenize_function, batched=True)
+ds_eval = ds_eval.map(tokenize_function, batched=True)
 
-# 샘플 10개만 추출
-small_train = tokenized["train"].select(range(10))
-small_eval = tokenized["validation"].select(range(10))
+ds_train = ds_train.rename_column("label", "labels")
+ds_eval = ds_eval.rename_column("label", "labels")
+
+ds_train.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+ds_eval.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
 
 
 # -----------------------------
-# 4. 모델 불러오기 및 패치
+# 5. 모델 및 학습 설정
 # -----------------------------
 model = BertForSequenceClassification.from_pretrained("bert-base-uncased")
 replace_layernorm_with_approx(model)
 
-# -----------------------------
-# 5. 훈련 설정
-# -----------------------------
 training_args = TrainingArguments(
     output_dir="./results-small",
     evaluation_strategy="epoch",
@@ -158,25 +167,27 @@ training_args = TrainingArguments(
     logging_steps=1,
 )
 
-metric = load_metric("glue", "sst2")
-
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
-    return metric.compute(predictions=preds, references=labels)
+    acc = (preds == labels).mean()
+    return {"accuracy": acc}
 
 
+# -----------------------------
+# 6. Trainer 실행
+# -----------------------------
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=small_train,
-    eval_dataset=small_eval,
+    train_dataset=ds_train,
+    eval_dataset=ds_eval,
     compute_metrics=compute_metrics,
 )
 
 trainer.train()
 results = trainer.evaluate()
 
-print("\n=== [SST-2] Validation Accuracy (Sample 10개) ===")
+print("\n=== [SST-2 Sample 10개] Validation Accuracy ===")
 print(f"Accuracy: {results['eval_accuracy']*100:.2f}%")
