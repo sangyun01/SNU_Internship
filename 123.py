@@ -1,4 +1,113 @@
-import transformers
+import numpy as np
+import torch
+import gc
 
-print(transformers.__version__)
-print(transformers.__file__)
+# 파일 목록
+file_map = {
+    "1": "bert_sst2_embed.npy",
+    "2": "bert_qnli_embed.npy",
+    "3": "bert_mnli_embed.npy",
+    "4": "bert_sst2_embed_100.npy",
+    "5": "distilbert_sst2_embed.npy",
+    "6": "distilbert_qnli_embed.npy",
+    "7": "distilbert_mnli_embed.npy",
+    "8": "distilbert_sst2_embed_100.npy",
+}
+
+D = 768
+
+
+# Q8.8 변환 함수
+def float_to_q8_8(x):
+    return np.round(x * 256).astype(np.int16)
+
+
+def q8_8_to_float(x_q):
+    return x_q.astype(np.float32) / 256
+
+
+# pairwise 분산
+def pairwise_variance_q8_8(x_q, G=16):
+    D = x_q.shape[-1]
+    splits = np.split(x_q, G, axis=-1)
+    n_list = [s.shape[-1] for s in splits]
+    mu_list = [np.sum(s, axis=-1, keepdims=True) // s.shape[-1] for s in splits]
+    M_list = [
+        np.sum(((s - mu).astype(np.int64)) ** 2, axis=-1, keepdims=True)
+        for s, mu in zip(splits, mu_list)
+    ]
+    while len(mu_list) > 1:
+        next_mu, next_M, next_n = [], [], []
+        for i in range(0, len(mu_list), 2):
+            μ1, μ2 = mu_list[i], mu_list[i + 1]
+            M1, M2 = M_list[i], M_list[i + 1]
+            n1, n2 = n_list[i], n_list[i + 1]
+            n_total = n1 + n2
+            delta = μ1 - μ2
+            delta_sq = (delta.astype(np.int64)) ** 2
+            n_total_shift = int(np.log2(n_total))
+            delta_term = (delta_sq * n1 * n2) >> n_total_shift
+            M12 = M1 + M2 + delta_term
+            mu12 = (μ1 * n1 + μ2 * n2) >> n_total
+            next_mu.append(mu12)
+            next_M.append(M12)
+            next_n.append(n_total)
+        mu_list, M_list, n_list = next_mu, next_M, next_n
+    var_q16 = M_list[0] // D
+    return q8_8_to_float(var_q16 >> 8)
+
+
+# PWL 근사
+sqrt_npz = np.load("pwl_sqrt.npz")
+sqrt_breaks = sqrt_npz["breaks"]
+sqrt_slopes = sqrt_npz["slopes"]
+sqrt_intercepts = sqrt_npz["intercepts"]
+
+recip_npz = np.load("pwl_recip.npz")
+recip_breaks = recip_npz["breaks"]
+recip_slopes = recip_npz["slopes"]
+recip_intercepts = recip_npz["intercepts"]
+
+
+def pwl_approx(variance, breakpoints, slopes, intercepts):
+    variance = np.clip(variance, breakpoints[0], breakpoints[-1])
+    out = np.zeros_like(variance)
+    for i in range(len(slopes)):
+        mask = (variance >= breakpoints[i]) & (variance < breakpoints[i + 1])
+        out[mask] = slopes[i] * variance[mask] + intercepts[i]
+    out[variance >= breakpoints[-1]] = (
+        slopes[-1] * variance[variance >= breakpoints[-1]] + intercepts[-1]
+    )
+    return out
+
+
+def approx_layernorm_q8_8(x_q, eps=1e-5):
+    mu_q = np.mean(x_q, axis=-1, keepdims=True)
+    x_centered = x_q - mu_q
+    var_approx = pairwise_variance_q8_8(x_q)
+    sqrt_val = pwl_approx(var_approx + eps, sqrt_breaks, sqrt_slopes, sqrt_intercepts)
+    recip_val = pwl_approx(sqrt_val, recip_breaks, recip_slopes, recip_intercepts)
+    x_float = q8_8_to_float(x_centered)
+    return x_float * recip_val
+
+
+def acc(y_hat, y_true):
+    return (
+        100 - (np.mean(np.abs(y_true - y_hat)) / (np.mean(np.abs(y_true)) + 1e-8)) * 100
+    )
+
+
+# 전체 처리
+for idx, file_name in file_map.items():
+    np_embeddings_f = np.load(file_name)
+    torch_input = torch.tensor(np_embeddings_f, dtype=torch.float32)
+    layernorm_torch = torch.nn.LayerNorm(D, elementwise_affine=False)
+    Y_true = layernorm_torch(torch_input).numpy()
+    np_embeddings_q8_8 = float_to_q8_8(np_embeddings_f).astype(np.int32)
+    Y_approx = approx_layernorm_q8_8(np_embeddings_q8_8)
+    accuracy = acc(Y_approx, Y_true)
+    print(f"{file_name} : {accuracy:.4f}%")
+
+    # 메모리 정리
+    del np_embeddings_f, torch_input, Y_true, np_embeddings_q8_8, Y_approx
+    gc.collect()
