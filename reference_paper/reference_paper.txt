@@ -1,0 +1,2 @@
+1. 2022-Hotchips-DFX-2209.10797v
+2. 2025-ISCAS-1392-Layer Normalization Approximations
